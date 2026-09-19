@@ -1462,6 +1462,470 @@ def test_serial_timeline_invalid_body_422(client, payload):
     assert resp.status_code == 422
 
 
+# ---------- 多权威节点 RRset 快照一致性检查 ----------
+
+
+def _rr(owner, ttl, rdata, rrtype="A", rrclass="IN") -> dict:
+    return {"owner": owner, "type": rrtype, "class": rrclass, "ttl": ttl, "rdata": rdata}
+
+
+def _snapshot_payload(nodes, min_agreement=2) -> dict:
+    return {"min_agreement": min_agreement, "nodes": nodes}
+
+
+def _node(name, *rrsets) -> dict:
+    return {"name": name, "rrsets": list(rrsets)}
+
+
+def test_snapshot_consistency_full_consensus_200(client):
+    payload = _snapshot_payload(
+        [
+            _node("ns1", _rr("www.example.com", 300, ["192.0.2.1", "192.0.2.2"])),
+            _node("ns2", _rr("www.example.com", 300, ["192.0.2.1", "192.0.2.2"])),
+        ]
+    )
+    resp = client.post(
+        "/api/zones/example.com/snapshot-consistency", json=payload
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["zone"] == "example.com"
+    assert body["node_count"] == 2
+    assert body["min_agreement"] == 2
+    assert body["conflicts"] == []
+    snapshot = body["consensus_snapshot"]
+    assert len(snapshot) == 1
+    assert snapshot[0] == {
+        "owner": "www.example.com",
+        "type": "A",
+        "class": "IN",
+        "ttl": 300,
+        "rdata": ["192.0.2.1", "192.0.2.2"],
+        "agreed_nodes": ["ns1", "ns2"],
+        "dissenting_nodes": [],
+    }
+    # 全部一致时逐节点差异为空
+    assert body["node_diffs"] == [
+        {"node": "ns1", "missing": [], "extra": [], "mismatched": []},
+        {"node": "ns2", "missing": [], "extra": [], "mismatched": []},
+    ]
+    # 结果不落库
+    assert client.get("/api/audits").json() == []
+    assert client.get("/api/zones/example.com/serial-reservations").json() == []
+
+
+def test_snapshot_consistency_normalizes_owner_type_and_rdata_order(client):
+    # owner 大小写/末尾根点/@、type/class 大小写、rdata 顺序与重复项全部规范化后一致
+    payload = _snapshot_payload(
+        [
+            _node(
+                "ns1",
+                _rr("WWW.Example.COM.", 300, ["192.0.2.2", "192.0.2.1"], rrtype="a", rrclass="in"),
+                _rr("@", 3600, ["ns2.example.com."], rrtype="NS"),
+            ),
+            _node(
+                "ns2",
+                _rr("www.example.com", 300, ["192.0.2.1", "192.0.2.1", "192.0.2.2"]),
+                _rr("example.com.", 3600, ["ns2.example.com."], rrtype="ns"),
+            ),
+        ]
+    )
+    resp = client.post(
+        "/api/zones/example.com/snapshot-consistency", json=payload
+    )
+    assert resp.status_code == 200
+    snapshot = resp.json()["consensus_snapshot"]
+    assert [(rr["owner"], rr["type"], rr["class"], rr["rdata"]) for rr in snapshot] == [
+        ("example.com", "NS", "IN", ["ns2.example.com."]),
+        ("www.example.com", "A", "IN", ["192.0.2.1", "192.0.2.2"]),
+    ]
+
+
+def test_snapshot_consistency_majority_wins_with_dissenters(client):
+    # 3 节点中 2 个持有同一变体，第 3 个 TTL 不同 => 多数变体进入共识并给出 mismatched
+    payload = _snapshot_payload(
+        [
+            _node("ns1", _rr("www", 300, ["192.0.2.1"])),
+            _node("ns2", _rr("www", 300, ["192.0.2.1"])),
+            _node("ns3", _rr("www", 60, ["192.0.2.1"])),
+        ],
+        min_agreement=2,
+    )
+    resp = client.post(
+        "/api/zones/example.com/snapshot-consistency", json=payload
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    rrset = body["consensus_snapshot"][0]
+    assert rrset["ttl"] == 300
+    assert rrset["agreed_nodes"] == ["ns1", "ns2"]
+    assert rrset["dissenting_nodes"] == ["ns3"]
+    diff_ns3 = next(d for d in body["node_diffs"] if d["node"] == "ns3")
+    assert diff_ns3["missing"] == []
+    assert diff_ns3["extra"] == []
+    mismatch = diff_ns3["mismatched"]
+    assert len(mismatch) == 1
+    assert mismatch[0]["owner"] == "www"
+    assert mismatch[0]["consensus"]["ttl"] == 300
+    assert mismatch[0]["node_rrset"]["ttl"] == 60
+    assert mismatch[0]["node_rrset"]["rdata"] == ["192.0.2.1"]
+    # 其余节点无差异
+    for name in ("ns1", "ns2"):
+        diff = next(d for d in body["node_diffs"] if d["node"] == name)
+        assert diff == {"node": name, "missing": [], "extra": [], "mismatched": []}
+
+
+def test_snapshot_consistency_rdata_difference_is_mismatch(client):
+    payload = _snapshot_payload(
+        [
+            _node("ns1", _rr("www", 300, ["192.0.2.1"])),
+            _node("ns2", _rr("www", 300, ["192.0.2.2"])),
+            _node("ns3", _rr("www", 300, ["192.0.2.2"])),
+        ],
+        min_agreement=2,
+    )
+    resp = client.post(
+        "/api/zones/example.com/snapshot-consistency", json=payload
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["consensus_snapshot"][0]["rdata"] == ["192.0.2.2"]
+    diff_ns1 = next(d for d in body["node_diffs"] if d["node"] == "ns1")
+    mismatch = diff_ns1["mismatched"][0]
+    assert mismatch["consensus"]["rdata"] == ["192.0.2.2"]
+    assert mismatch["node_rrset"]["rdata"] == ["192.0.2.1"]
+
+
+def test_snapshot_consensus_tiebreak_rdata_then_ttl(client):
+    # 2 节点各持一个变体且同意门槛为 1：按 rdata 序列字典序升序决出确定结果
+    payload = _snapshot_payload(
+        [
+            _node("a", _rr("h", 300, ["192.0.2.9"])),
+            _node("b", _rr("h", 300, ["192.0.2.1"])),
+        ],
+        min_agreement=1,
+    )
+    resp = client.post(
+        "/api/zones/example.com/snapshot-consistency", json=payload
+    )
+    assert resp.status_code == 200
+    assert resp.json()["consensus_snapshot"][0]["rdata"] == ["192.0.2.1"]
+
+
+def test_snapshot_consensus_tiebreak_lower_ttl_when_rdata_equal(client):
+    # rdata 相同、TTL 不同且支持数并列时取较小 TTL
+    payload = _snapshot_payload(
+        [
+            _node("a", _rr("h", 600, ["1.1.1.1"])),
+            _node("b", _rr("h", 300, ["1.1.1.1"])),
+        ],
+        min_agreement=1,
+    )
+    resp = client.post(
+        "/api/zones/example.com/snapshot-consistency", json=payload
+    )
+    assert resp.status_code == 200
+    assert resp.json()["consensus_snapshot"][0]["ttl"] == 300
+
+
+def test_snapshot_consistency_min_agreement_one_with_disjoint_keys(client):
+    # 门槛为 1 时各节点独有键都进共识，并互相记 missing
+    payload = _snapshot_payload(
+        [
+            _node("ns1", _rr("a", 300, ["1.1.1.1"])),
+            _node("ns2", _rr("b", 60, ["2.2.2.2"])),
+        ],
+        min_agreement=1,
+    )
+    resp = client.post(
+        "/api/zones/example.com/snapshot-consistency", json=payload
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [rr["owner"] for rr in body["consensus_snapshot"]] == ["a", "b"]
+    assert body["consensus_snapshot"][0]["dissenting_nodes"] == ["ns2"]
+    diff_ns1, diff_ns2 = body["node_diffs"]
+    assert diff_ns1["missing"] == [
+        {"owner": "b", "type": "A", "class": "IN", "ttl": 60, "rdata": ["2.2.2.2"]}
+    ]
+    assert diff_ns2["missing"] == [
+        {"owner": "a", "type": "A", "class": "IN", "ttl": 300, "rdata": ["1.1.1.1"]}
+    ]
+
+
+def test_snapshot_consistency_empty_snapshots(client):
+    payload = _snapshot_payload(
+        [_node("ns1"), _node("ns2", )], min_agreement=2
+    )
+    resp = client.post(
+        "/api/zones/example.com/snapshot-consistency", json=payload
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["consensus_snapshot"] == []
+    assert all(d["missing"] == [] and d["extra"] == [] and d["mismatched"] == []
+               for d in body["node_diffs"])
+
+
+def test_snapshot_consistency_409_lists_conflicts_and_partial_consensus(client):
+    # NS 三节点一致进共识；MX 仅 1 节点持有 => 409
+    payload = _snapshot_payload(
+        [
+            _node(
+                "ns1",
+                _rr("@", 3600, ["ns1.example.com.", "ns2.example.com."], rrtype="NS"),
+            ),
+            _node(
+                "ns2",
+                _rr("@", 3600, ["ns1.example.com.", "ns2.example.com."], rrtype="NS"),
+                _rr("@", 600, ["10 mx1.example.com."], rrtype="MX"),
+            ),
+            _node(
+                "ns3",
+                _rr("@", 3600, ["ns1.example.com.", "ns2.example.com."], rrtype="NS"),
+            ),
+        ],
+        min_agreement=2,
+    )
+    resp = client.post(
+        "/api/zones/example.com/snapshot-consistency", json=payload
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "insufficient_consensus"
+    assert detail["zone"] == "example.com"
+    assert detail["node_count"] == 3
+    assert detail["min_agreement"] == 2
+    assert len(detail["conflicts"]) == 1
+    conflict = detail["conflicts"][0]
+    assert conflict == {
+        "owner": "example.com",
+        "type": "MX",
+        "class": "IN",
+        "best_agreement": 1,
+        "variants": [
+            {"ttl": 600, "rdata": ["10 mx1.example.com."], "nodes": ["ns2"]}
+        ],
+        "missing_nodes": ["ns1", "ns3"],
+    }
+    # 部分共识快照与逐节点差异仍然返回；未达门槛的键计入持有节点 extra
+    partial = detail["consensus_snapshot"]
+    assert len(partial) == 1
+    assert partial[0]["owner"] == "example.com"
+    assert partial[0]["type"] == "NS"
+    assert partial[0]["agreed_nodes"] == ["ns1", "ns2", "ns3"]
+    diffs = {d["node"]: d for d in detail["node_diffs"]}
+    assert diffs["ns2"]["extra"] == [
+        {"owner": "example.com", "type": "MX", "class": "IN",
+         "ttl": 600, "rdata": ["10 mx1.example.com."]}
+    ]
+    assert diffs["ns1"]["extra"] == [] and diffs["ns1"]["missing"] == []
+    assert diffs["ns3"]["extra"] == [] and diffs["ns3"]["missing"] == []
+
+
+def test_snapshot_consistency_409_multiple_conflicts_sorted(client):
+    # 3 个冲突键（含不同 type/class），按 owner/type/class 排序返回
+    payload = _snapshot_payload(
+        [
+            _node(
+                "ns1",
+                _rr("z", 300, ["1.1.1.1"]),
+                _rr("a", 300, ["10 mail"], rrtype="MX"),
+                _rr("a", 300, ["zone."], rrtype="SOA"),
+            ),
+            _node("ns2"),
+        ],
+        min_agreement=2,
+    )
+    resp = client.post(
+        "/api/zones/example.com/snapshot-consistency", json=payload
+    )
+    assert resp.status_code == 409
+    conflicts = resp.json()["detail"]["conflicts"]
+    assert [(c["owner"], c["type"], c["class"]) for c in conflicts] == [
+        ("a", "MX", "IN"),
+        ("a", "SOA", "IN"),
+        ("z", "A", "IN"),
+    ]
+    for conflict in conflicts:
+        assert conflict["missing_nodes"] == ["ns2"]
+
+
+def test_snapshot_consistency_409_variants_descending_by_support(client):
+    # 同一 RRset 出现三个不同变体（不同 rdata），按支持数降序
+    payload = _snapshot_payload(
+        [
+            _node("ns1", _rr("www", 300, ["192.0.2.1"])),
+            _node("ns2", _rr("www", 300, ["192.0.2.2"])),
+            _node("ns3", _rr("www", 300, ["192.0.2.3"])),
+            _node("ns4", _rr("www", 300, ["192.0.2.1"])),
+        ],
+        min_agreement=3,
+    )
+    resp = client.post(
+        "/api/zones/example.com/snapshot-consistency", json=payload
+    )
+    assert resp.status_code == 409
+    conflict = resp.json()["detail"]["conflicts"][0]
+    assert conflict["best_agreement"] == 2
+    variants = conflict["variants"]
+    assert [v["rdata"] for v in variants] == [
+        ["192.0.2.1"],
+        ["192.0.2.2"],
+        ["192.0.2.3"],
+    ]
+    assert variants[0]["nodes"] == ["ns1", "ns4"]
+    assert variants[1]["nodes"] == ["ns2"]
+    assert variants[2]["nodes"] == ["ns3"]
+    assert conflict["missing_nodes"] == []
+
+
+def test_snapshot_consistency_threshold_boundary(client):
+    # 恰好达到门槛 => 200；门槛 +1 => 409
+    base_nodes = [
+        _node("ns1", _rr("www", 300, ["1.1.1.1"])),
+        _node("ns2", _rr("www", 300, ["1.1.1.1"])),
+        _node("ns3", _rr("www", 300, ["2.2.2.2"])),
+    ]
+    ok = client.post(
+        "/api/zones/example.com/snapshot-consistency",
+        json=_snapshot_payload(base_nodes, min_agreement=2),
+    )
+    assert ok.status_code == 200
+    bad = client.post(
+        "/api/zones/example.com/snapshot-consistency",
+        json=_snapshot_payload(base_nodes, min_agreement=3),
+    )
+    assert bad.status_code == 409
+    assert bad.json()["detail"]["conflicts"][0]["best_agreement"] == 2
+
+
+def test_snapshot_consistency_duplicate_rrset_identical_is_idempotent(client):
+    # 同一节点内完全相同（规范化后）的重复 RRset 按一条处理
+    payload = _snapshot_payload(
+        [
+            _node(
+                "ns1",
+                _rr("WWW.", 300, ["1.1.1.1"]),
+                _rr("www", 300, ["1.1.1.1", "1.1.1.1"]),
+            ),
+            _node("ns2", _rr("www", 300, ["1.1.1.1"])),
+        ],
+        min_agreement=2,
+    )
+    resp = client.post(
+        "/api/zones/example.com/snapshot-consistency", json=payload
+    )
+    assert resp.status_code == 200
+    assert len(resp.json()["consensus_snapshot"]) == 1
+
+
+def test_snapshot_consistency_contradictory_rrset_same_node_422(client):
+    # 同一节点对同一键给出 TTL 不同的两个变体 => 422
+    payload = _snapshot_payload(
+        [
+            _node(
+                "ns1",
+                _rr("www.", 300, ["1.1.1.1"]),
+                _rr("www", 60, ["1.1.1.1"]),
+            ),
+            _node("ns2", _rr("www", 300, ["1.1.1.1"])),
+        ],
+        min_agreement=2,
+    )
+    resp = client.post(
+        "/api/zones/example.com/snapshot-consistency", json=payload
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "duplicate_rrset_in_snapshot"
+    assert detail["conflicts"] == [
+        {"node": "ns1", "owner": "www", "type": "A", "class": "IN"}
+    ]
+
+
+def test_snapshot_consistency_rdata_is_case_sensitive(client):
+    # RDATA 文本大小写敏感：不同大小写视为不同变体
+    payload = _snapshot_payload(
+        [
+            _node("ns1", _rr("txt", 300, ["Hello"], rrtype="TXT")),
+            _node("ns2", _rr("txt", 300, ["hello"], rrtype="TXT")),
+        ],
+        min_agreement=2,
+    )
+    resp = client.post(
+        "/api/zones/example.com/snapshot-consistency", json=payload
+    )
+    assert resp.status_code == 409
+    variants = resp.json()["detail"]["conflicts"][0]["variants"]
+    assert [v["rdata"] for v in variants] == [["Hello"], ["hello"]]
+
+
+def test_snapshot_consistency_not_persisted_on_409(client):
+    payload = _snapshot_payload(
+        [_node("ns1", _rr("a", 1, ["1"])), _node("ns2")], min_agreement=2
+    )
+    resp = client.post(
+        "/api/zones/example.com/snapshot-consistency", json=payload
+    )
+    assert resp.status_code == 409
+    assert client.get("/api/audits").json() == []
+    assert client.get("/api/zones/example.com/serial-reservations").json() == []
+
+
+def test_snapshot_consistency_invalid_zone_400(client):
+    resp = client.post(
+        "/api/zones/bad_zone!/snapshot-consistency",
+        json=_snapshot_payload([_node("ns1")], min_agreement=1),
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _snapshot_payload([], min_agreement=1),                         # 空节点列表
+        _snapshot_payload([_node("ns1")], min_agreement=2),            # 门槛超过节点数
+        _snapshot_payload([_node("ns1")], min_agreement=0),            # 门槛下界
+        {"nodes": [_node("ns1")]},                                     # 缺 min_agreement
+        {"min_agreement": 1},                                         # 缺 nodes
+        _snapshot_payload(                                             # 节点名重复（规范化空白后）
+            [_node(" ns1 "), _node("ns1")], min_agreement=1),
+        _snapshot_payload([_node("   ")], min_agreement=1),            # 空白节点名
+        _snapshot_payload(                                             # 非法 owner
+            [_node("ns1", _rr("bad owner", 1, ["x"]))], min_agreement=1),
+        _snapshot_payload(                                             # TTL 越界
+            [_node("ns1", _rr("a", -1, ["x"]))], min_agreement=1),
+        _snapshot_payload(                                             # TTL 上越界
+            [_node("ns1", _rr("a", 2**31, ["x"]))], min_agreement=1),
+        _snapshot_payload(                                             # rdata 为空
+            [_node("ns1", _rr("a", 1, []))], min_agreement=1),
+        _snapshot_payload(                                             # rdata 空白条目
+            [_node("ns1", _rr("a", 1, ["   "]))], min_agreement=1),
+        _snapshot_payload(                                             # 非法 type
+            [_node("ns1", {"owner": "a", "type": "1A", "class": "IN",
+                           "ttl": 1, "rdata": ["x"]})], min_agreement=1),
+        _snapshot_payload(                                             # 非法 class
+            [_node("ns1", _rr("a", 1, ["x"], rrclass="1N"))], min_agreement=1),
+        "not-an-object",                                              # 请求体非对象
+    ],
+)
+def test_snapshot_consistency_invalid_body_422(client, payload):
+    resp = client.post(
+        "/api/zones/example.com/snapshot-consistency", json=payload
+    )
+    assert resp.status_code == 422
+
+
+def test_snapshot_normalize_owner_unit():
+    from app.snapshot import normalize_owner
+
+    assert normalize_owner("@", "Example.COM") == "example.com"
+    assert normalize_owner("WWW.Example.COM.", "example.com") == "www.example.com"
+    assert normalize_owner("  root.  ", "example.com") == "root"
+    assert normalize_owner(".", "example.com") == "."
+
+
 # ---------- 并发：串行化分配，不重复 serial ----------
 
 def test_concurrent_reservations_no_duplicate_serials(tmp_path):

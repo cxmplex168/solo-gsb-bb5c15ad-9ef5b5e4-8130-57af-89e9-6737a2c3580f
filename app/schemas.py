@@ -564,3 +564,275 @@ class SerialTimelineConflictResponse(BaseModel):
     """时间线无法延续时 409 响应体（HTTPException 的标准 detail 包装）。"""
 
     detail: SerialTimelineConflictDetail
+
+
+# ---------- 多权威节点 RRset 快照一致性检查 ----------
+
+# 合法的 RR owner 名：标签由字母/数字/下划线/连字符组成，允许 @ 顶点、根点与末尾根点
+_RR_LABEL = r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?"
+_RR_OWNER_RE = re.compile(
+    rf"^@$|^\.$|^(?:{_RR_LABEL}\.)+{_RR_LABEL}?\.?$|^{_RR_LABEL}\.?$"
+)
+# 已知 RR TYPE（大写字母开头）或 TYPE<数字> 泛型类型；CLASS 为大写字母/数字组合
+_RR_TYPE_RE = re.compile(r"^(?:[A-Z][A-Z0-9]*|TYPE[0-9]+)$")
+_RR_CLASS_RE = re.compile(r"^[A-Z][A-Z0-9]*$")
+
+
+def validate_rr_owner(value: str) -> str:
+    """去首尾空白并校验 RRset owner 名（不做大小写/根点归一化），非法时抛 ValueError。"""
+    owner = value.strip()
+    if not owner or not _RR_OWNER_RE.match(owner):
+        raise ValueError("非法的 RRset owner 名称")
+    if len(owner.strip(".")) > 253:
+        raise ValueError("RRset owner 名称超过 253 字节长度限制")
+    return owner
+
+
+class SnapshotRRset(BaseModel):
+    """快照中的单个 RRset；输出与输入字段名均为 ``type``/``class``。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    owner: str = Field(
+        min_length=1,
+        max_length=255,
+        examples=["www.example.com"],
+        description="RRset owner（去首尾空白；大小写与末尾根点在比较时规范化，@ 表示区域顶点）",
+    )
+    rrtype: str = Field(
+        alias="type",
+        min_length=1,
+        max_length=10,
+        examples=["A"],
+        description="RR 类型（去首尾空白并转大写，如 A/AAAA/MX 或 TYPE65 泛型形式）",
+    )
+    rrclass: str = Field(
+        alias="class",
+        min_length=1,
+        max_length=10,
+        examples=["IN"],
+        description="RR 类别（去首尾空白并转大写，如 IN/CH）",
+    )
+    ttl: int = Field(
+        ge=0,
+        le=2**31 - 1,
+        description="RRset TTL（秒，0..2147483647）",
+    )
+    rdata: list[str] = Field(
+        min_length=1,
+        max_length=4096,
+        description=(
+            "RRset 的 RDATA 列表（每条非空白；比较时逐条去首尾空白、去重并按"
+            "字典序排序，即 RRset 内记录无序；RDATA 文本大小写敏感）"
+        ),
+    )
+
+    @field_validator("owner")
+    @classmethod
+    def _check_owner(cls, value: str) -> str:
+        return validate_rr_owner(value)
+
+    @field_validator("rrtype")
+    @classmethod
+    def _check_type(cls, value: str) -> str:
+        rrtype = value.strip().upper()
+        if not _RR_TYPE_RE.match(rrtype):
+            raise ValueError("非法的 RR 类型（应为大写字母开头的名称或 TYPE<数字>）")
+        return rrtype
+
+    @field_validator("rrclass")
+    @classmethod
+    def _check_class(cls, value: str) -> str:
+        rrclass = value.strip().upper()
+        if not _RR_CLASS_RE.match(rrclass):
+            raise ValueError("非法的 RR 类别（应为大写字母/数字组成的名称）")
+        return rrclass
+
+    @field_validator("rdata")
+    @classmethod
+    def _check_rdata(cls, value: list[str]) -> list[str]:
+        if any(not item.strip() for item in value):
+            raise ValueError("rdata 条目不能为空或全空白")
+        if any(len(item) > 65535 for item in value):
+            raise ValueError("单条 rdata 长度不能超过 65535 字符")
+        return value
+
+
+class SnapshotNodeInput(BaseModel):
+    """一个权威节点上报的 RRset 快照。"""
+
+    name: str = Field(
+        min_length=1,
+        max_length=253,
+        examples=["ns1.example.com"],
+        description="权威节点名（去首尾空白后须在请求内唯一）",
+    )
+    rrsets: list[SnapshotRRset] = Field(
+        default_factory=list,
+        max_length=4096,
+        description="该节点当前持有的 RRset 快照（可空，表示空区域快照）",
+    )
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        name = value.strip()
+        if not name:
+            raise ValueError("权威节点名不能为空")
+        return name
+
+
+class SnapshotConsistencyCreate(BaseModel):
+    """多权威节点 RRset 快照一致性检查请求（仅计算，不写库）。"""
+
+    nodes: list[SnapshotNodeInput] = Field(
+        min_length=1,
+        max_length=256,
+        description="权威节点快照列表（至少 1 个、至多 256 个；节点名去首尾空白后须唯一）",
+    )
+    min_agreement: int = Field(
+        ge=1,
+        description=(
+            "最小同意节点数：某 RRset 至少有这么多节点持有同一规范化变体"
+            "（TTL 与 rdata 均一致）才进入共识快照；超过节点数返回 422"
+        ),
+        examples=[2],
+    )
+
+    @model_validator(mode="after")
+    def _check_unique_names_and_threshold(self) -> "SnapshotConsistencyCreate":
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for node in self.nodes:
+            if node.name in seen and node.name not in duplicates:
+                duplicates.append(node.name)
+            seen.add(node.name)
+        if duplicates:
+            raise ValueError(f"权威节点名须唯一，重复节点名: {', '.join(duplicates)}")
+        if self.min_agreement > len(self.nodes):
+            raise ValueError(
+                f"min_agreement（{self.min_agreement}）不能超过权威节点数（{len(self.nodes)}）"
+            )
+        return self
+
+
+class CanonicalRRset(BaseModel):
+    """规范化后的 RRset（owner 小写去根点，rdata 去重排序）。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    owner: str
+    rrtype: str = Field(alias="type")
+    rrclass: str = Field(alias="class")
+    ttl: int
+    rdata: list[str] = Field(description="去首尾空白、去重并按字典序排序后的 RDATA")
+
+
+class ConsensusRRset(CanonicalRRset):
+    """共识快照中的单个 RRset 及其同意/异议节点。"""
+
+    agreed_nodes: list[str] = Field(
+        description="持有该共识变体（TTL 与 rdata 均一致）的节点名（字典序）"
+    )
+    dissenting_nodes: list[str] = Field(
+        description="持有其他变体或缺少该 RRset 的节点名（字典序）"
+    )
+
+
+class SnapshotMismatch(BaseModel):
+    """节点快照与共识在同一 (owner,type,class) 键上的变体差异。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    owner: str
+    rrtype: str = Field(alias="type")
+    rrclass: str = Field(alias="class")
+    consensus: CanonicalRRset = Field(description="多数共识变体")
+    node_rrset: CanonicalRRset = Field(description="该节点实际持有的变体")
+
+
+class SnapshotNodeDiff(BaseModel):
+    """单个权威节点相对共识快照的差异。"""
+
+    node: str
+    missing: list[CanonicalRRset] = Field(
+        description="共识快照中存在、但本节点缺少的 RRset（按 owner/type/class 排序）"
+    )
+    extra: list[CanonicalRRset] = Field(
+        description="本节点持有、但未进入共识快照的 RRset（含未达门槛的键；按 owner/type/class 排序）"
+    )
+    mismatched: list[SnapshotMismatch] = Field(
+        description="本节点与共识变体（TTL 或 rdata）不一致的 RRset（按 owner/type/class 排序）"
+    )
+
+
+class SnapshotConsistencyOut(BaseModel):
+    """全部 RRset 达成共识（200）响应体。"""
+
+    zone: str
+    node_count: int = Field(ge=1)
+    min_agreement: int = Field(ge=1)
+    consensus_snapshot: list[ConsensusRRset] = Field(
+        description="可发布的共识快照（按 owner/type/class 排序）"
+    )
+    node_diffs: list[SnapshotNodeDiff] = Field(
+        description="逐节点相对共识快照的差异（与请求节点顺序一致）"
+    )
+    conflicts: list[dict] = Field(
+        default_factory=list, description="200 时恒为空列表；冲突 RRset 仅出现在 409 响应中"
+    )
+    note: str
+
+
+class SnapshotConflictVariant(BaseModel):
+    """冲突 RRset 的一个候选变体及其支持节点。"""
+
+    ttl: int
+    rdata: list[str] = Field(description="规范化（去重排序）后的 RDATA")
+    nodes: list[str] = Field(description="持有该变体的节点名（字典序）")
+
+
+class SnapshotConflictRRset(BaseModel):
+    """未达到最小同意节点数的冲突 RRset。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    owner: str
+    rrtype: str = Field(alias="type")
+    rrclass: str = Field(alias="class")
+    best_agreement: int = Field(
+        ge=0, description="该 RRset 各变体中的最高支持节点数（仍小于 min_agreement）"
+    )
+    variants: list[SnapshotConflictVariant] = Field(
+        description=(
+            "出现过的全部变体（支持数降序；并列按 rdata 序列、TTL 字典序升序）"
+        )
+    )
+    missing_nodes: list[str] = Field(
+        description="完全缺少该 RRset 的节点名（字典序）"
+    )
+
+
+class SnapshotConsensusConflictDetail(BaseModel):
+    """存在未达门槛 RRset 时 409 响应的 detail 结构。"""
+
+    reason: Literal["insufficient_consensus"]
+    message: str
+    zone: str
+    node_count: int = Field(ge=1)
+    min_agreement: int = Field(ge=1)
+    conflicts: list[SnapshotConflictRRset] = Field(
+        description="未达最小同意节点数的冲突 RRset（按 owner/type/class 排序）"
+    )
+    consensus_snapshot: list[ConsensusRRset] = Field(
+        description="已达成门槛的部分共识快照（可用于收敛核对）"
+    )
+    node_diffs: list[SnapshotNodeDiff] = Field(
+        description="逐节点相对部分共识快照的差异（未达门槛的键计入各节点 extra）"
+    )
+
+
+class SnapshotConsensusConflictResponse(BaseModel):
+    """存在冲突 RRset 时 409 响应体（HTTPException 的标准 detail 包装）。"""
+
+    detail: SnapshotConsensusConflictDetail

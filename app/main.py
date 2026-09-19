@@ -22,6 +22,9 @@ from .schemas import (
     SerialTimelineConflictResponse,
     SerialTimelineCreate,
     SerialTimelineOut,
+    SnapshotConsensusConflictResponse,
+    SnapshotConsistencyCreate,
+    SnapshotConsistencyOut,
     TransferSimulationConflictResponse,
     TransferSimulationCreate,
     TransferSimulationOut,
@@ -30,6 +33,11 @@ from .schemas import (
 from .repair import build_repair_plan
 from .release_plan import ReleasePlanError, build_release_plan
 from .service import analyze
+from .snapshot import (
+    SnapshotConsensusError,
+    SnapshotValidationError,
+    build_snapshot_consistency,
+)
 from .suggest import SuggestionError, suggest_next_serial
 from .timeline import (
     LatestObservationConflict,
@@ -348,6 +356,65 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 },
             ) from exc
         except TimelineError as exc:
+            raise HTTPException(status_code=409, detail=exc.detail) from exc
+
+    @app.post(
+        "/api/zones/{zone}/snapshot-consistency",
+        response_model=SnapshotConsistencyOut,
+        responses={
+            409: {
+                "model": SnapshotConsensusConflictResponse,
+                "description": (
+                    "存在未达到最小同意节点数的 RRset（insufficient_consensus，"
+                    "detail 列出冲突 RRset 及其全部变体、部分共识快照与逐节点差异）"
+                ),
+            },
+            422: {
+                "description": (
+                    "同一节点快照内相同 (owner,type,class) 出现矛盾变体"
+                    "（reason=duplicate_rrset_in_snapshot）；"
+                    "节点名重复、min_agreement 越界、owner/type/class/ttl/rdata"
+                    " 校验失败等其余请求体问题同样返回 422"
+                ),
+            },
+        },
+    )
+    def check_snapshot_consistency(zone: str, payload: SnapshotConsistencyCreate) -> dict:
+        """多权威节点 RRset 快照一致性检查（不落库）。
+
+        规范化 owner（小写、去末尾根点、``@`` 为区域顶点）、type/class
+        （大写）与 RRset 内 rdata 顺序（去重排序，按无序集合比较）后，
+        以 ``(owner, type, class)`` 为键汇总各节点变体，取得最多节点支持且
+        支持数不低于 ``min_agreement`` 的变体进入可发布的共识快照；最高支持
+        数并列时按 rdata 序列、TTL 字典序升序决出确定结果。返回共识快照、
+        逐节点差异（missing/extra/mismatched）；任一 RRset 未达门槛时返回
+        409 并列出全部冲突 RRset。结果即时计算，不写入数据库。
+        """
+        zone_name = _normalize_zone(zone)
+        nodes = [
+            (
+                node.name,
+                [
+                    (rr.owner, rr.rrtype, rr.rrclass, rr.ttl, rr.rdata)
+                    for rr in node.rrsets
+                ],
+            )
+            for node in payload.nodes
+        ]
+        try:
+            return build_snapshot_consistency(
+                zone_name, nodes, payload.min_agreement
+            )
+        except SnapshotValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "reason": exc.code,
+                    "message": str(exc),
+                    "conflicts": exc.conflicts,
+                },
+            ) from exc
+        except SnapshotConsensusError as exc:
             raise HTTPException(status_code=409, detail=exc.detail) from exc
 
     return app
