@@ -11,6 +11,7 @@
 - 提供 **多权威节点共同发布规划**（`POST /api/zones/{zone}/release-plans`，仅规划不写库）：提交各权威节点的名称与当前 serial，在当日 `YYYYMMDD00`～`99` 候选区间内从小到大找出首个相对**每个节点**都是 RFC 1982 有效前进的候选值；当日区间不存在共同候选时返回 **409**，并给出各节点的 `equal`/`regression`/`incomparable` 阻断摘要；
 - 提供 **区域传送收敛预演**（`POST /api/zones/{zone}/transfer-simulations`，仅预演不写库）：给定各节点当前 serial、有向传送边、源节点与发布 serial，模拟第 0 轮源节点发布后的逐轮同步传播（每节点只从上一轮上游中选择相对自身为 RFC 1982 有效前进且前向距离最小的值，距离并列按上游名排序，所有节点同时更新），返回逐轮变更、最终快照与未收敛节点；达到 `max_rounds` 后仍有节点可更新时返回 **409** 并携带当前快照。
 - 提供 **多源观测 serial 时间线重建**（`POST /api/zones/{zone}/serial-timelines`，仅计算不写库）：接收多个采集源（collector）在不同时刻上报的 SOA serial，按 `bucket_seconds` 做时间桶聚合，桶内同一采集源只取 `observed_at` 最新观测（最新时刻出现不同 serial 返回 **422**）；再用动态规划从各桶候选值中选出一条相邻桶只含 RFC 1982 相等或有效前进关系的时间线，目标依次为最大化采集源支持数、最少跳变、完全并列按整条 serial 序列字典序升序；倒退与不可比较一律禁止，首个无法延续的桶返回 **409** 并给出冲突位置与最优前缀。
+- 提供 **权威快照一致性检查**（`POST /api/zones/{zone}/snapshot-consistency`，仅检查不写库）：接收多个权威节点的 RRset 快照（owner、type、class、ttl、rdata）与最小同意节点数 `min_agreeing`，将属主名规范化为小写无尾点、类型与类大写、rdata 去重排序后，按 RRset 统计各取值（含"缺席"）的同意节点数，取**唯一最高票**且达到门槛的值为共识；返回可发布的共识快照、逐节点差异（mismatch/missing/extra）与冲突 RRset；任一 RRset 最高票未达门槛或达到门槛但并列时返回 **409** 并列出各取值的投票分布。
 
 ## 快速启动（单条命令）
 
@@ -47,6 +48,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/api/zones/{zone}/release-plans` | 多权威节点共同发布规划，不写库（200；当日无共同候选返回 409） |
 | `POST` | `/api/zones/{zone}/transfer-simulations` | 区域传送收敛预演，不写库（200；达到轮次上限仍可更新返回 409） |
 | `POST` | `/api/zones/{zone}/serial-timelines` | 多源观测 serial 时间线重建，不写库（200；桶内最新观测冲突 422；无法延续 409） |
+| `POST` | `/api/zones/{zone}/snapshot-consistency` | 权威快照一致性检查，不写库（200；任一 RRset 未达成唯一多数共识返回 409） |
 | `GET` | `/health` | 健康检查 |
 
 ### 提交审计
@@ -453,6 +455,111 @@ curl -s -X POST http://localhost:8000/api/zones/example.com/serial-timelines \
 - **桶内最新观测冲突（422）**：同一采集源在桶内的最新时刻同时出现不同 serial 时返回 **422**，`detail.reason` 为 `conflicting_latest_observation`，`detail.conflicts` 给出每个冲突的桶位置、采集源与 serial 集合（按桶序号与采集源名排序）；
 - `4294967295 → 0` 这类回绕观测属于有效前进，可正常跨桶延续；`bucket_seconds` 必须为正整数，观测列表不能为空，`serial` 越界、时间格式非法、采集源名为空白等请求问题返回 **422**；路径中区域名非法返回 **400**。
 
+### 权威快照一致性检查
+
+`POST /api/zones/{zone}/snapshot-consistency` 用于多权威（multi-primary/anycast）部署下的**发布前快照核对**：提交若干权威节点各自上报的 RRset 快照与最小同意节点数 `min_agreeing`，服务端按 RRset 计算多数共识，返回**可发布的共识快照**、**逐节点差异**与**冲突 RRset**。结果**仅即时计算，不写入数据库**（不会产生审计或预留记录）。
+
+请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `nodes` | 节点列表（至少 1 个、至多 256 个）；每项含 `name`（节点名，去除首尾空白后须在请求内唯一）与 `rrsets`（该节点上报的 RRset 列表，可为空、至多 4096 条） |
+| `min_agreeing` | RRset 达成共识所需的最小同意节点数（`1..节点数`，超过节点数返回 422）；**唯一最高票**且同意节点数 ≥ 该值的取值才构成共识 |
+
+每条 RRset 快照字段：`owner`（属主名）、`type`（记录类型）、`class`（记录类）、`ttl`（`0..2147483647`，RFC 2181 的 31 位非负整数）、`rdata`（记录数据列表，至少 1 条）。规范化规则：
+
+- `owner` 去首尾空白、去末尾根点并转小写（允许 `_dmarc`、`_sip._tcp` 这类前导下划线标签）；`type` / `class` 去首尾空白并转大写；
+- `rdata` 逐条去首尾空白（空白串报错）、去重并按字典序排序——**记录顺序不影响一致性判定**；rdata 按字符串精确比较，不做类型感知的大小写归一；
+- 同一节点内 `(owner, type, class)` 键重复返回 **422**。
+
+共识规则：检查域为所有节点上报 RRset 键的并集；每个节点对每个键要么持有一个取值 `(ttl, rdata 集合)`，要么**缺席**——缺席同样作为一种"取值"参与计票，因此"多数节点都没有该 RRset"也能形成共识（该键不进入可发布快照）。对每个键统计各取值的同意节点数：
+
+- 某一取值**唯一最高票**且票数 ≥ `min_agreeing` → 该值为共识；共识为存在的键进入可发布快照，共识为缺席的键不进入快照（仍上报了该键的节点记为 `extra` 差异）；
+- 最高票**未达门槛**（`cause=below_threshold`）或达到门槛但**多值并列**（`cause=tied`，如 4 节点 2-2 分裂、`min_agreeing=2`）→ 该键冲突；只要存在任一冲突键即返回 **409**。
+
+```bash
+curl -s -X POST http://localhost:8000/api/zones/example.com/snapshot-consistency \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "min_agreeing": 2,
+        "nodes": [
+          {"name": "ns1", "rrsets": [
+            {"owner": "example.com", "type": "SOA", "class": "IN", "ttl": 3600,
+             "rdata": ["ns1.example.com. hostmaster.example.com. 2026091901 7200 3600 1209600 300"]},
+            {"owner": "www.example.com", "type": "A", "class": "IN", "ttl": 300,
+             "rdata": ["192.0.2.1", "192.0.2.2"]}
+          ]},
+          {"name": "ns2", "rrsets": [
+            {"owner": "example.com.", "type": "soa", "class": "in", "ttl": 3600,
+             "rdata": ["ns1.example.com. hostmaster.example.com. 2026091901 7200 3600 1209600 300"]},
+            {"owner": "WWW.EXAMPLE.COM.", "type": "A", "class": "IN", "ttl": 300,
+             "rdata": ["192.0.2.2", "192.0.2.1"]}
+          ]},
+          {"name": "ns3", "rrsets": [
+            {"owner": "example.com", "type": "SOA", "class": "IN", "ttl": 3600,
+             "rdata": ["ns1.example.com. hostmaster.example.com. 2026091901 7200 3600 1209600 300"]},
+            {"owner": "www.example.com", "type": "A", "class": "IN", "ttl": 600,
+             "rdata": ["192.0.2.1", "192.0.2.2"]}
+          ]}
+        ]
+      }'
+```
+
+```json
+{
+  "zone": "example.com",
+  "min_agreeing": 2,
+  "node_count": 3,
+  "snapshot": [
+    {"owner": "example.com", "type": "SOA", "class": "IN", "ttl": 3600,
+     "rdata": ["ns1.example.com. hostmaster.example.com. 2026091901 7200 3600 1209600 300"],
+     "supporters": ["ns1", "ns2", "ns3"], "dissenters": []},
+    {"owner": "www.example.com", "type": "A", "class": "IN", "ttl": 300,
+     "rdata": ["192.0.2.1", "192.0.2.2"],
+     "supporters": ["ns1", "ns2"], "dissenters": ["ns3"]}
+  ],
+  "nodes": [
+    {"name": "ns1", "consistent": true,  "diffs": []},
+    {"name": "ns2", "consistent": true,  "diffs": []},
+    {"name": "ns3", "consistent": false, "diffs": [
+      {"owner": "www.example.com", "type": "A", "class": "IN", "diff": "mismatch",
+       "reported":  {"ttl": 600, "rdata": ["192.0.2.1", "192.0.2.2"]},
+       "consensus": {"ttl": 300, "rdata": ["192.0.2.1", "192.0.2.2"]}}
+    ]}
+  ],
+  "conflicts": [],
+  "note": "共识快照仅依据本次请求中的节点快照即时计算，不写入数据库；RRset 以 (owner, type, class) 为键，属主名规范化为小写无尾点、类型与类大写、rdata 去重并按字典序排序；共识值为唯一最高票且同意节点数达到 min_agreeing 的取值"
+}
+```
+
+- `snapshot[]` 按 `(owner, type, class)` 字典序排列，每项给出共识取值与支持/异议节点（`supporters`/`dissenters` 按名字典序）；上例中 ns2 的大小写、末尾根点与 rdata 顺序差异被规范化消除，ns3 的 TTL 不同则构成 `mismatch`；
+- `nodes[]` 按请求顺序给出逐节点差异：`mismatch`（取值不同，`reported`/`consensus` 双方取值）、`missing`（节点未上报共识存在的 RRset，`reported` 为 `null`）、`extra`（节点上报了共识为不存在的 RRset，`consensus` 为 `null`）；差异仅覆盖**已达成共识**的键，冲突键的逐节点立场见 `conflicts`；
+- **冲突（409）**：任一 RRset 无法达成唯一多数共识时返回 **409**，`detail.reason` 为 `no_rrset_consensus`，`detail` 同时携带已达成共识的 `snapshot`/`nodes`，以及每个冲突键的取值投票分布（`values[].supporters` 按支持数降序、`absent` 为未上报节点名单）：
+
+```json
+{
+  "detail": {
+    "reason": "no_rrset_consensus",
+    "message": "1 个 RRset 未达成唯一多数共识（要求唯一最高票且同意节点数 ≥ 2）",
+    "zone": "example.com",
+    "min_agreeing": 2,
+    "node_count": 3,
+    "snapshot": [ "...已达成共识的 RRset..." ],
+    "nodes": [ "...逐节点差异..." ],
+    "conflicts": [
+      {"owner": "www.example.com", "type": "A", "class": "IN", "cause": "below_threshold",
+       "values": [
+         {"ttl": 300, "rdata": ["192.0.2.1"], "supporters": ["ns1"]},
+         {"ttl": 300, "rdata": ["192.0.2.2"], "supporters": ["ns2"]}
+       ],
+       "absent": ["ns3"]}
+    ]
+  }
+}
+```
+
+- 节点名重复/空白、`min_agreeing` 越界（小于 1 或大于节点数）、节点内 RRset 键重复、`rdata` 为空列表或含空白串、`ttl` 越界、属主/类型/类非法等请求问题返回 **422**；路径中区域名非法返回 **400**。
+
 ## 判定规则（RFC 1982）
 
 serial 是模 `2^32` 环形空间上的值。设前向距离 `d = (current - previous) mod 2^32`：
@@ -490,6 +597,7 @@ app/
   release_plan.py  # 多权威节点共同发布规划（不落库）
   transfer.py  # 区域传送收敛预演（不落库）
   timeline.py  # 多源观测 serial 时间线重建（不落库）
+  snapshot.py  # 权威快照一致性检查（不落库）
   service.py   # 逐项判定与汇总
   db.py        # SQLite 持久层（审计记录 + serial 预留的事务化分配与查询）
   schemas.py   # 请求/响应模型与校验

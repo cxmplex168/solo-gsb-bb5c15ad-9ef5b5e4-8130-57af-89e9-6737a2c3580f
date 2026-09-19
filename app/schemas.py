@@ -564,3 +564,254 @@ class SerialTimelineConflictResponse(BaseModel):
     """时间线无法延续时 409 响应体（HTTPException 的标准 detail 包装）。"""
 
     detail: SerialTimelineConflictDetail
+
+
+# ---------- 权威快照一致性检查 ----------
+
+# 记录类型/类助记符：字母开头的短 token（兼容 TYPE#### / CLASS#### 形式）
+_RR_TOKEN_RE = re.compile(r"^[A-Z][A-Z0-9-]{0,14}$")
+
+# DNS 属主名：在区域名规则之上允许前导下划线标签（如 _dmarc、_sip._tcp）
+_OWNER_LABEL = rf"_?{_LABEL}"
+_OWNER_RE = re.compile(rf"^(?:{_OWNER_LABEL}\.)+{_OWNER_LABEL}?\.?$|^{_OWNER_LABEL}\.?$")
+
+
+def validate_owner(value: str) -> str:
+    """规范化 DNS 属主名：去首尾空白、去末尾根点、转小写后校验。"""
+    owner = value.strip().rstrip(".").lower()
+    if not owner or not _OWNER_RE.match(owner):
+        raise ValueError("非法的 DNS 属主名")
+    return owner
+
+
+class SnapshotRRset(BaseModel):
+    """单条 RRset 快照：属主、类型、类、TTL 与记录数据集合。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    owner: str = Field(
+        min_length=1,
+        max_length=253,
+        examples=["www.example.com"],
+        description="属主名（规范化：去首尾空白、去末尾根点、转小写；允许前导下划线标签）",
+    )
+    type: str = Field(
+        min_length=1,
+        max_length=15,
+        examples=["A"],
+        description="记录类型助记符（规范化：去首尾空白、转大写）",
+    )
+    class_: str = Field(
+        alias="class",
+        min_length=1,
+        max_length=15,
+        examples=["IN"],
+        description="记录类助记符（规范化：去首尾空白、转大写）",
+    )
+    ttl: int = Field(
+        ge=0,
+        le=2**31 - 1,
+        description="TTL 秒数（RFC 2181：31 位非负整数）",
+    )
+    rdata: list[str] = Field(
+        min_length=1,
+        max_length=4096,
+        description="记录数据集合（至少 1 条；逐条去首尾空白、去重并按字典序排序）",
+        examples=[["192.0.2.1", "192.0.2.2"]],
+    )
+
+    @field_validator("owner")
+    @classmethod
+    def _check_owner(cls, value: str) -> str:
+        return validate_owner(value)
+
+    @field_validator("type", "class_")
+    @classmethod
+    def _check_token(cls, value: str) -> str:
+        token = value.strip().upper()
+        if not token or not _RR_TOKEN_RE.match(token):
+            raise ValueError("非法的记录类型/类助记符")
+        return token
+
+    @field_validator("rdata")
+    @classmethod
+    def _check_rdata(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for item in value:
+            text = item.strip()
+            if not text:
+                raise ValueError("rdata 不能为空字符串")
+            if text not in cleaned:
+                cleaned.append(text)
+        return sorted(cleaned)
+
+
+class SnapshotNode(BaseModel):
+    """一个权威节点上报的 RRset 快照集合。"""
+
+    name: str = Field(
+        min_length=1, max_length=253, examples=["ns1.example.com"], description="节点名（请求内唯一）"
+    )
+    rrsets: list[SnapshotRRset] = Field(
+        default_factory=list,
+        max_length=4096,
+        description="该节点上报的 RRset 快照（(owner, type, class) 键在节点内须唯一）",
+    )
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        name = value.strip()
+        if not name:
+            raise ValueError("节点名不能为空")
+        return name
+
+    @model_validator(mode="after")
+    def _check_unique_rrset_keys(self) -> "SnapshotNode":
+        seen: set[tuple[str, str, str]] = set()
+        for rrset in self.rrsets:
+            key = (rrset.owner, rrset.type, rrset.class_)
+            if key in seen:
+                raise ValueError(
+                    f"节点 {self.name} 内 RRset 键重复: {key[0]}/{key[1]}/{key[2]}"
+                )
+            seen.add(key)
+        return self
+
+
+class SnapshotConsistencyCreate(BaseModel):
+    """权威快照一致性检查请求（仅计算，不写库）。"""
+
+    nodes: list[SnapshotNode] = Field(
+        min_length=1,
+        max_length=256,
+        description="参与一致性检查的权威节点及其 RRset 快照（节点名去首尾空白后须唯一）",
+    )
+    min_agreeing: int = Field(
+        ge=1,
+        description="RRset 达成共识所需的最小同意节点数（须 ≤ 节点数；唯一最高票且达到该数才构成共识）",
+        examples=[2],
+    )
+
+    @model_validator(mode="after")
+    def _check_quorum(self) -> "SnapshotConsistencyCreate":
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for node in self.nodes:
+            if node.name in seen and node.name not in duplicates:
+                duplicates.append(node.name)
+            seen.add(node.name)
+        if duplicates:
+            raise ValueError(f"节点名须唯一，重复节点名: {', '.join(duplicates)}")
+        if self.min_agreeing > len(self.nodes):
+            raise ValueError(
+                f"min_agreeing（{self.min_agreeing}）不能超过节点数（{len(self.nodes)}）"
+            )
+        return self
+
+
+class RRsetValue(BaseModel):
+    """RRset 的取值：TTL + 规范化后的 rdata 集合。"""
+
+    ttl: int
+    rdata: list[str] = Field(description="去重并按字典序排序的记录数据")
+
+
+class ConsensusRRset(BaseModel):
+    """达成共识并进入可发布快照的 RRset。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    owner: str
+    type: str
+    class_: str = Field(alias="class")
+    ttl: int
+    rdata: list[str]
+    supporters: list[str] = Field(description="上报取值与共识一致的节点（按名字典序）")
+    dissenters: list[str] = Field(
+        description="上报取值与共识不一致或未上报该 RRset 的节点（按名字典序）"
+    )
+
+
+class SnapshotNodeDiff(BaseModel):
+    """单个节点相对共识快照的一处差异。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    owner: str
+    type: str
+    class_: str = Field(alias="class")
+    diff: Literal["mismatch", "missing", "extra"] = Field(
+        description="mismatch=取值不同；missing=节点未上报共识存在的 RRset；extra=节点上报了共识为不存在的 RRset"
+    )
+    reported: RRsetValue | None = Field(description="该节点上报的取值；未上报（missing）时为 null")
+    consensus: RRsetValue | None = Field(description="共识取值；共识为不存在（extra）时为 null")
+
+
+class SnapshotNodeConsistency(BaseModel):
+    """单个节点与共识快照的比对结果。"""
+
+    name: str
+    consistent: bool = Field(description="该节点上报快照是否与全部共识 RRset 一致")
+    diffs: list[SnapshotNodeDiff] = Field(
+        description="相对共识的差异列表（按 owner/type/class 字典序；完全一致时为空）"
+    )
+
+
+class ConflictRRsetValue(RRsetValue):
+    """冲突 RRset 的一个候选取值及其支持节点。"""
+
+    supporters: list[str] = Field(description="上报该取值的节点（按名字典序）")
+
+
+class ConflictRRset(BaseModel):
+    """无法达成唯一多数共识的 RRset。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    owner: str
+    type: str
+    class_: str = Field(alias="class")
+    cause: Literal["below_threshold", "tied"] = Field(
+        description="below_threshold=最高票未达 min_agreeing；tied=最高票达到门槛但多个取值并列"
+    )
+    values: list[ConflictRRsetValue] = Field(
+        description="各上报取值及其支持节点（按支持数降序，再按 ttl/rdata 字典序）"
+    )
+    absent: list[str] = Field(description="未上报该 RRset 的节点（按名字典序）")
+
+
+class SnapshotConsistencyBase(BaseModel):
+    """一致性检查结果（200 与 409 共用的字段）。"""
+
+    zone: str
+    min_agreeing: int = Field(description="达成共识所需的最小同意节点数")
+    node_count: int = Field(ge=1, description="参与检查的节点数")
+    snapshot: list[ConsensusRRset] = Field(
+        description="可发布的共识快照（按 owner/type/class 字典序；409 时仅含已达成共识的部分）"
+    )
+    nodes: list[SnapshotNodeConsistency] = Field(
+        description="逐节点与共识快照的差异（按请求节点顺序；仅覆盖已达成共识的 RRset）"
+    )
+    conflicts: list[ConflictRRset] = Field(
+        description="未达成唯一多数共识的 RRset（200 时恒为空）"
+    )
+
+
+class SnapshotConsistencyOut(SnapshotConsistencyBase):
+    """全部 RRset 达成共识（200）响应体。"""
+
+    note: str
+
+
+class SnapshotConsistencyConflictDetail(SnapshotConsistencyBase):
+    """存在冲突 RRset 时 409 响应的 detail 结构。"""
+
+    reason: Literal["no_rrset_consensus"]
+    message: str
+
+
+class SnapshotConsistencyConflictResponse(BaseModel):
+    """存在冲突 RRset 时 409 响应体（HTTPException 的标准 detail 包装）。"""
+
+    detail: SnapshotConsistencyConflictDetail

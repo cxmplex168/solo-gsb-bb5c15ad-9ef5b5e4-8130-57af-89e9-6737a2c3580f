@@ -22,6 +22,9 @@ from .schemas import (
     SerialTimelineConflictResponse,
     SerialTimelineCreate,
     SerialTimelineOut,
+    SnapshotConsistencyConflictResponse,
+    SnapshotConsistencyCreate,
+    SnapshotConsistencyOut,
     TransferSimulationConflictResponse,
     TransferSimulationCreate,
     TransferSimulationOut,
@@ -30,6 +33,7 @@ from .schemas import (
 from .repair import build_repair_plan
 from .release_plan import ReleasePlanError, build_release_plan
 from .service import analyze
+from .snapshot import SnapshotConsistencyError, check_snapshot_consistency
 from .suggest import SuggestionError, suggest_next_serial
 from .timeline import (
     LatestObservationConflict,
@@ -349,6 +353,62 @@ def create_app(db_path: str | None = None) -> FastAPI:
             ) from exc
         except TimelineError as exc:
             raise HTTPException(status_code=409, detail=exc.detail) from exc
+
+    @app.post(
+        "/api/zones/{zone}/snapshot-consistency",
+        response_model=SnapshotConsistencyOut,
+        responses={
+            409: {
+                "model": SnapshotConsistencyConflictResponse,
+                "description": (
+                    "任一 RRset 未达成唯一多数共识（no_rrset_consensus，detail 携带"
+                    "已达成共识的快照与逐节点差异，以及每个冲突 RRset 的取值投票分布）"
+                ),
+            }
+        },
+    )
+    def check_zone_snapshot_consistency(
+        zone: str, payload: SnapshotConsistencyCreate
+    ) -> dict:
+        """多权威节点 RRset 快照一致性检查（仅计算，不写库）。
+
+        各节点上报的 RRset 以 ``(owner, type, class)`` 为键：属主名规范化为
+        小写无尾点、类型与类大写、rdata 去重并按字典序排序后，对每个键统计
+        各取值（含"缺席"）的同意节点数；**唯一最高票**且达到 ``min_agreeing``
+        的取值即共识值。共识为存在的键构成可发布共识快照，响应同时给出逐节点
+        差异（mismatch/missing/extra）。任一键最高票并列或未达门槛时返回 409，
+        ``detail.conflicts`` 列出冲突 RRset 的取值投票分布与缺席节点。
+        """
+        zone_name = _normalize_zone(zone)
+        nodes = [
+            (
+                node.name,
+                {
+                    (rrset.owner, rrset.type, rrset.class_): (
+                        rrset.ttl,
+                        tuple(rrset.rdata),
+                    )
+                    for rrset in node.rrsets
+                },
+            )
+            for node in payload.nodes
+        ]
+        try:
+            result = check_snapshot_consistency(
+                zone_name, nodes, payload.min_agreeing
+            )
+        except SnapshotConsistencyError as exc:
+            detail = dict(exc.result)
+            detail["reason"] = exc.code
+            detail["message"] = str(exc)
+            raise HTTPException(status_code=409, detail=detail) from exc
+        result["note"] = (
+            "共识快照仅依据本次请求中的节点快照即时计算，不写入数据库；"
+            "RRset 以 (owner, type, class) 为键，属主名规范化为小写无尾点、"
+            "类型与类大写、rdata 去重并按字典序排序；共识值为唯一最高票且"
+            "同意节点数达到 min_agreeing 的取值"
+        )
+        return result
 
     return app
 
